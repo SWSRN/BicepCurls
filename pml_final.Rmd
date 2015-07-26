@@ -1,0 +1,476 @@
+---
+title: "Bicep curls training"
+author: "SWSRN"
+date: "July 25, 2015"
+output:
+  html_document:
+    pandoc_args: [
+      "+RTS", "-K64m",
+      "-RTS"
+    ]
+---
+## Introduction
+In this project, my goal will be to use data (Weight Lifting Exercise Dataset)
+from accelerometers on the belt, forearm, arm, and dumbbell of 6 participants. They were asked to perform barbell lifts correctly (class A) and incorrectly in 4 different ways
+(classes B, C, D and E). This data set is unusual for 
+quantifying how well an activity is done, as well as the more commonly 
+measured how much is done.
+The group Human Activity Recognition http://groupware.les.inf.puc-rio.br/har
+has kindly provided this data set (cite 3). An edited version of this data set
+was downloaded for training from
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+and for testing from 
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv.
+
+## Libraries
+```{r packageVersions, echo=FALSE, eval=FALSE}
+    #packageVersion('AppliedPredictiveModeling')  #‘1.1.6’ same
+    packageVersion('caret')                      #‘6.0.47’same
+    packageVersion('ElemStatLearn')              # ‘2015.6.26’ newer
+    packageVersion('pgmm')                      # ‘1.2’ newer
+    packageVersion('rpart')                     # 4.1.8 same
+    # install.packages('rpart.plot')                    
+```
+```{r libraries, echo=FALSE}
+    #library(AppliedPredictiveModeling)
+    library(caret)
+    require(partykit)
+    require(rpart)
+    require(rpart.plot)
+```
+<!--- Note: RStudio is having trouble looking up some function names, so I resorted
+to explicitly prefixing the package name, e.g. $caret::$. This only seems to 
+happen when $cache = TRUE$ for code blocks in R Markdown.
+--->
+
+## Reading Data 
+```{r read, cache = FALSE}
+ train <- read.csv('pml-training.csv', na.strings=c("#DIV/0!", "", "NA"), 
+                   stringsAsFactors=FALSE)
+ test <- read.csv('pml-testing.csv', na.strings ="NA")
+
+```
+
+## Clean data and reduce number of columns
+
+Initially $train$ has `r nrow(train)` rows and `r ncol(train)` columns.
+There are a lot of columns with 
+mostly blanks, or divide by zero or NA (treated as NA's by $read.csv()$
+above.)
+Except there are numbers in those columns when 
+$train\$new\_window$ is equal to $yes$. These are only a few rows, don't worry about them. (Deleting these rows made little difference in results.)
+Remove columns with any NA's.
+```{r discardNAs, cache = FALSE, echo=TRUE}
+train_noNA <- train[,colSums(is.na(train)) == 0] 
+test_noNA <- test[,colSums(is.na(test)) == 0]  
+```
+
+Coerce the column classes to match in the two data sets train and test.
+```{r checkclass, cache = FALSE}
+  for (i in 1:ncol(test_noNA)) {
+      if (names(test_noNA)[i] != names(train_noNA)[i] ) {#check col. aignment
+          message( 'name ', i,'!!! ', names(test_noNA)[i], " != ",  
+            names(train_noNA)[i])  
+      }
+      if (class(test_noNA[,i]) != class(train_noNA[,i]) ) {#convert type
+          message( 'class ', i,' ', names(test_noNA)[i], ' ',
+            class(test_noNA[,i]), "!=", class(train_noNA[,i]) )
+          if (class(train_noNA[,i]) == 'character') {
+              test_noNA[,i] <- as.character(test_noNA[,i])
+          }
+          if (class(test_noNA[,i]) == 'integer') {
+              train_noNA[,i] <- as.integer(train_noNA[,i])
+          }
+      }
+  }
+```
+Make the dates POSIX. 
+<!--- Remove the column $new\_window$ since it only has the value $'no'$. --->
+Make the column $classe$ a factor variable.
+```{r datetime, cache = FALSE}
+  train_noNA$cvtd_timestamp <- as.POSIXct(strptime(train_noNA$cvtd_timestamp, "%d/%m/%Y %H:%M"))
+test_noNA$cvtd_timestamp <- as.POSIXct(strptime(test_noNA$cvtd_timestamp, "%d/%m/%Y %H:%M"))
+train_noNA$classe <- as.factor(train_noNA$classe)
+```
+
+Remove additional columns which should not be relevant, i.e. non-numeric ($user\_name$, $new\_window$) or sequential($X$, $num\_window$) or time. 
+```{r removeMore, echo-FALSE}
+  #names(train_noNA)[1:7]
+  #class(train_noNA)
+  #summary(train_noNA)
+  train_noNA <- subset(train_noNA, select = -X)
+  train_noNA <- subset(train_noNA, select = -user_name)
+  train_noNA <- subset(train_noNA, select = -raw_timestamp_part_1)
+  train_noNA <- subset(train_noNA, select = -raw_timestamp_part_2)
+  train_noNA <- subset(train_noNA, select = -new_window)
+  train_noNA <- subset(train_noNA, select = -cvtd_timestamp)
+  train_noNA <- subset(train_noNA, select = -num_window)
+
+  test_noNA <- subset(test_noNA, select = -X)
+  test_noNA <- subset(test_noNA, select = -user_name)
+  test_noNA <- subset(test_noNA, select = -raw_timestamp_part_1)
+  test_noNA <- subset(test_noNA, select = -raw_timestamp_part_2)
+  test_noNA <- subset(test_noNA, select = -new_window)
+  test_noNA <- subset(test_noNA, select = -cvtd_timestamp)
+  test_noNA <- subset(test_noNA, select = -num_window)
+  
+  #ncol(train_noNA)
+  #names(train_noNA)
+```
+
+Note that if column "X" (1,2,3, ...) is not removed, it will be the only column used by the random tree routine to fit to the class classe, because the file is sorted in order of A, B, C, D, E. The result will be
+an implausibly perfect fit! 
+
+<!--- Note that the number of columns left `r ncol(train_noNA)' corresponds to 
+three times the number of 3-vectors (15*3 = 45). It is not clear how exactly these correspond to those features used in the paper (cite 3),
+so we can not expect to duplicate the results.
+--->
+
+The remaining variables:
+
+vector variables
+
+1. "roll_belt"            "pitch_belt"           "yaw_belt" 
+2. "gyros_belt_x"         "gyros_belt_y"     "gyros_belt_z"
+3. "accel_belt_x"         "accel_belt_y" "accel_belt_z"
+4. "magnet_belt_x"        "magnet_belt_y"   "magnet_belt_z"
+5. "roll_arm"             "pitch_arm" "yaw_arm" 
+6. "gyros_arm_x" "gyros_arm_y"          "gyros_arm_z" 
+7. "magnet_arm_x" "magnet_arm_y"         "magnet_arm_z" 
+8. "roll_dumbbell" "pitch_dumbbell"       "yaw_dumbbell"  
+1. "gyros_dumbbell_x"     "gyros_dumbbell_y"     "gyros_dumbbell_z"
+1. "accel_dumbbell_x"     "accel_dumbbell_y"     "accel_dumbbell_z"
+1. "magnet_dumbbell_x"    "magnet_dumbbell_y"    "magnet_dumbbell_z"  
+1. "roll_forearm"         "pitch_forearm"        "yaw_forearm"  
+1. "gyros_forearm_x"      "gyros_forearm_y"    "gyros_forearm_z" 
+1. "accel_forearm_x"      "accel_forearm_y"  "accel_forearm_z"
+1. "magnet_forearm_x"     "magnet_forearm_y" "magnet_forearm_z"  
+
+scalar variables
+
+1. "total_accel_belt"    
+2. "total_accel_arm"
+3. "total_accel_dumbbell"
+3. "total_accel_forearm"
+3. "classe"  (Our result variable.)
+
+There are numerous 3 vectors of the sort (roll, pitch, yaw) and (x,y,z).
+There are summary scalars of the sort acceleration.
+<!---
+This number of variables is in agreement with the research paper (cite 3)
+and there is no need to eliminate further columns. In fact, the researchers 
+have indicated which columns they eliminated with NA's and blanks. 
+--->
+We chose to remove the 3-D x-y-z vectors for acceleration and assume that they will
+be well represented by the total accelerations (total_accel_belt, total_accel_arm,
+total_accel_dumbbell and total_accel_forearm.) 
+```{r removeAbsolutes}
+train_noNA <- subset(train_noNA, select = -accel_belt_x)
+train_noNA <- subset(train_noNA, select = -accel_belt_y)
+train_noNA <- subset(train_noNA, select = -accel_belt_z)
+train_noNA <- subset(train_noNA, select = -accel_arm_x)
+train_noNA <- subset(train_noNA, select = -accel_arm_y)
+train_noNA <- subset(train_noNA, select = -accel_arm_z)
+train_noNA <- subset(train_noNA, select = -accel_dumbbell_x)
+train_noNA <- subset(train_noNA, select = -accel_dumbbell_y)
+train_noNA <- subset(train_noNA, select = -accel_dumbbell_z)
+train_noNA <- subset(train_noNA, select = -accel_forearm_x)
+train_noNA <- subset(train_noNA, select = -accel_forearm_y)
+train_noNA <- subset(train_noNA, select = -accel_forearm_z)
+```
+
+
+## Check for correlations
+ Look at correlations ($symnum(cor(train_noNA))$) to see if additional columns 
+ should be eliminated. 
+<!--- Input must be numeric, so exclude column classe. --->
+We discard "duplicate"
+ columns at the 1.0 and 0.95 correlation levels, as these have little
+ effect on the resulting accuracy.
+```{r cor, echo=FALSE}
+cor1 <- cor(subset(train_noNA, echo=FALSE, select = -classe))
+#symnum(cor1) ## Graphical Correlation Matrix: Don't plot because BIG
+#[1] 0 ' ' 0.3 '.' 0.6 ',' 0.8 '+' 0.9 '*' 0.95 'B' 1
+# Only B's (roll_belt, total_accel_belt) 
+#   (gyros_dumbbell_x,gyros_dumbbell_z)
+# only *'s (gyros_arm_x, gyros_arm_y)
+#   (gyros_dumbbell_x, gyros_forearm_z)
+#   (gyros_dumbbell_z, gyros_forearm_z)
+# only +'s (roll_belt, yaw_belt)
+#   (pitch_belt, magnet_belt_x)
+#   (magnet_arm_y, magnet_arm_z)
+#   (gyros_forearm_y, gyros_forearm_z)
+```
+```{r cor_subset}
+train_noNA <- subset(train_noNA, select = -roll_belt)  # to 1.0 correlation
+train_noNA <- subset(train_noNA, select = -gyros_arm_x)# to 1.0 correlation
+train_noNA <- subset(train_noNA, select = -gyros_dumbbell_x)# to 0.95 correlation
+train_noNA <- subset(train_noNA, select = -gyros_dumbbell_z)# to 0.95 correlation
+```
+```{r cor_subset2, echo=FALSE}
+#train_noNA <- subset(train_noNA, select = -yaw_belt)  # to 0.9 correlation
+#train_noNA <- subset(train_noNA, select = -magnet_belt_x)  # to 0.9 correlation
+#train_noNA <- subset(train_noNA, select = -magnet_arm_y)  # to 0.9 correlation
+#train_noNA <- subset(train_noNA, select = -gyros_forearm_y)  # to 0.9 correlation
+nc <- ncol(train_noNA)
+```
+<!--- removing up to 0.9 correlation columns: accuracy 0.8846  
+removing up to 0.95 correlation columns: accuracy 0.93  
+removing up to 1.0 correlation columns: accuracy 0.898
+Not using correlation matrix guidance accuracy   0.911
+--->
+
+## Partition the Data.
+Original file "pml-testing.csv" is too small to act as a test set 
+(only 20 rows), seen around in this file as the matrix test_noNA.
+We have to split "pml-training.csv" (matrix train_noNA) 
+into  70\% "training" and 30\% "testing" sets. 
+Sorry for any confusion with the naming!
+"By default, createDataPartition does a stratified random split of the data." (cite 2) This is good, since the data is sorted into long stretches of A's,
+then B's, etc.
+```{r partition}
+nr <- nrow(train_noNA)
+indexTrain <- createDataPartition(y=train_noNA$classe,p=0.7, list=FALSE)
+training <- train_noNA[indexTrain,]
+testing <- train_noNA[-indexTrain,]
+```
+
+## Training with cross validation. Training Accuracy (in sample error)
+Without any depth of knowledge, we try using the default values of 
+the method 'rpart" in train(). "rpart" stands for Recursive PARTitioning
+and uses binary tree models.
+"By default, rpart
+will conduct as many splits as possible, then use 10–fold (default 10)
+cross–validation to prune the tree." (cite ref. 1) We choose to use this default, under the assumption that it is a relatively 
+robust, safe method.
+<!---We want 5 final nodes (corresponding to bicep curl types A, B, C, D and E),
+so we set the tuneLength to 10, which is higher than 5. This allows up to 
+10 final nodes and makes the step size smaller for the accuracy table/plot.
+--->
+
+We do not select any special preprocessing.
+```{r preprocess, cache = FALSE}
+    #ncol(training)
+    #preProc <- preProcess(training, method="pca", thresh=80)
+    preProc <- training  # skip PCA for now.
+    #ncol(preProc)
+   #
+```
+```{r train, cache = FALSE}
+  set.seed(12345) # Should make results reproducible, but it doesn't. Naughty train().
+  tuneLen = 57
+  ecurl <- train(classe ~ ., data = preProc, method = 'rpart', 
+                   tuneLength = tuneLen)
+
+  ecurl  # accuracy vs. complexity factor
+```
+```{r train_output, cache = FALSE, echo=FALSE}
+#ecurl$results
+  #str(ecurl)
+  #str(ecurl$results)  # could fit below vectors
+  #ecurl$results$Accuracy
+  #ecurl$results$Kappa
+  #ecurl$results$cp
+  #ecurl$bestTune$cp
+```
+The results are vectors of length 57, corresponding to tuneLength.
+The "best" training from cross-validation is that with a 
+complexity parameter of cp = `r ecurl$results$cp[1]`,
+so the **best training accuracy 
+is `r ecurl$results$Accuracy[1]` $\pm$ `r ecurl$results$AccuracySD[1]`** 
+and the best kappa is 
+`r ecurl$results$Kappa[1]` $\pm$ `r ecurl$results$KappaSD[1]`.
+Since this is the first row, we are a bit suspicious.
+
+We have used the train() option $tuneLength$, which defaults to 3. 
+Values as high as about 90 "maximizes"" the training accuracy. However, with increasing
+values, the tree gets more and more branches and leaves and we suspect that 
+we may be over-fitting. From a suggestion from community TA Ronny Restrepo, we investigated the "train" vs. "test" data sets. The accuracy will always be a bit 
+lower for the test data set but the difference between the two will increase 
+as the model overfits the train data (see table below) and the test data accuracy stagnates. We felt a good compromise is tuneLength = 57. The table below shows our exploration.  For a fixed tuneLength, there is a fair amount of jiggle due to different random initializations within tune().
+```{r tune, echo=FALSE} 
+inp <- read.csv("rpart_accuracy_36_save.txt", header=T)
+#str(inp)
+inp[c("tuneLen", "diffAccur", "test_Accur", "train_Accur")]
+ #    # ecurl$results  # accuracy, kappa table for fitting criterion. 
+#   
+#
+```
+
+This plots the training accuracy as a function of the complexity parameter,
+with more complex trees on the left. The convergence point for this example is the
+left-most point. 
+
+```{r plot, echo=FALSE, cache = FALSE}
+    # rpart package
+    plot(ecurl) 
+```
+
+Below is our best decision tree in text format, which is rather long. Sorry!
+Due to the number of branches and leaves, the plot of  the tree has been left
+out, since it is overwhelmed.
+```{r plot2, echo=FALSE, cache = FALSE}
+    ecurl$finalModel  # text version of tree results.
+    #plot(ecurl$finalModel)
+
+    #= plots the classification tree with all nodes/splits. New class party.
+    precurl<- as.party(ecurl$finalModel)
+    #plot(precurl)          # too messy
+```
+
+```{r prune, echo=FALSE}
+  #ecurl.pruned <- prune(ecurl,cp=.02)
+  #ecurl.pruned
+  #plot(ecurl.pruned)
+  #ecurl$Importance
+  # ecurl.pruned$Importance
+
+```
+
+## Test on 30% reserved testing set
+Frequency histogram of A,B, etc. of predicted testing results.
+```{r testing_testing}
+  rpartPred_train <- predict(ecurl,training)
+  rpartPred <- predict(ecurl,testing)
+  #rpartPred <- predict(ecurl,testing,type="class")
+  #rpartPred  # too big
+  #str(rpartPred)   
+
+  plot(rpartPred)
+
+```
+
+## Results: Calculate accuracy (out of sample error) of test group by hand.
+Out of `r nrow(testing)` test samples, the number of misidentified classes is only 
+```{r byHand}
+sum(rpartPred != testing$classe)
+# df <- data.frame(testing$class, rpartPred)
+```
+giving an **accuracy rate (out of sample error) of 
+`r (nrow(testing) - sum(rpartPred != testing$classe))/nrow(testing)`.**
+But this is just a "by hand" estimate.
+
+## Results: Confusion Matrix and Accuracy
+
+
+Confusion matrix for testing and training sets. Shown is for testing data set.
+```{r confusion, echo=FALSE}
+  cm_train <- confusionMatrix(rpartPred_train, training$classe)
+  cm <- confusionMatrix(rpartPred, testing$classe)
+  ###cm <- confusionMatrix(rpartPred, testing$classe, norm='average')
+  #cm <- caret::confusionMatrix(rpartPred, testing$classe)
+```
+```{r confusion_file, echo=FALSE}
+  #str(cm)  #****
+  #str(cm$overall)
+  p0 <- paste(tuneLen, ", ", round(ecurl$bestTune$cp, 5), ', ',
+  #p0 <- paste(tuneLen, ", ", ecurl$bestTune$cp, ', ',
+                round((cm$overall[1] - cm_train$overall[1]),4), ', ') 
+  p1 <- paste(' "test", ', round(cm$overall[1], 3), ', ', 
+                round(cm$overall[3], 3), ', ',
+                round(cm$overall[4], 3))
+             # accuracy and range
+  p2 <- paste(' "train", ', round(cm_train$overall[1], 3), ', ', 
+                round(cm_train$overall[3], 3), ', ',
+                round(cm_train$overall[4], 3))
+             # accuracy and range
+#  str(cm_train$overall)
+#  cm_train$overall 
+  #cm$overall$Accuracy
+  #cm_train$overall$Accuracy
+
+  
+  filename <- paste0("rpart_accuracy_", nc,".txt")
+  line <- paste(p0, p1, p2)
+  write(line,file=filename,append=TRUE)
+  
+   
+```
+```{r confusion2}
+  confusionMatrix(rpartPred, testing$classe)
+```
+The confusion matrix's off diagonal elements show how many samples were
+mis-identified. The diagonal elements show how many were correctly identified.
+**The adjoining "Overall Statistics" also identifies the accuracy 
+(`r cm$overall[1]`), kappa (`r cm$overall[2]`) and 
+the p-value (`r cm$overall[7]`) for the test set.**
+In contrast, the training set has a "better" accuracy 
+(`r cm_train$overall[1]`), kappa (`r cm_train$overall[2]`) and 
+a p-value (`r cm_train$overall[7]`).
+
+
+  The spread in the accuracies for the training and test sets is
+  important for judging whether the model is over-fitting. 
+
+## Use 20 test cases file (from pml-testing.csv):
+
+When repeatly run this markdown file, 80-90% of the values stay the same,
+reflecting the accuracy of the model used. For a fixed tuneLength, there is a fair amount of jiggle in the predictions due to different random initializations within tune(). Most of it is for certain test numbers. This table is not being included in the rMarkdown output.
+
+```{r testing}
+   rpartPred_20 <- predict(ecurl,test_noNA)
+   #rpartPred_20   # Don't show prediction on the web
+ 
+```
+
+
+```{r jiggle, echo=FALSE} 
+#tuneLen cp  testAccur trainAccur predictions
+#                               1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0
+#57   0.00107   0.899   0.926   C A B A A C D C A A B C E A E E A B B B
+#57   0.00061   0.913   0.934   B A B A A E D B A A C B B A E E A B B B
+#57   0.00105   0.891   0.903   B A B A A C D D A A C C E A E E A B B B 
+#57   0.00081   0.897   0.919   B A B A A C D B A A C B B A E E A B B B 
+#57   0.00112   0.899   0.922   B A B A A C D C A A B C E A E E A B B B 
+#57   0.00098   0.902   0.927   B A A A A E E D A A E C B A E E A B A B 
+#57   0.00092   0.894   0.92    B A B A A B D C A A C E B A E E A B B B 
+#57   0.00081   0.897   0.919   B A B A A C D E A A C C B A E E A B B B 
+```
+
+```{r prepFiles, echo=FALSE}  
+# write prediction results for 20 cases to disk.
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }  
+}
+  #rpartPred_20  # ****
+
+  answers = rep("A", 20)
+  #str(rpartPred_20)  #****
+#  n = length(answers)
+#  for(i in 1:n){
+#      str(rpartPred_20[i])
+#      answers[i] <-  rpartPred_20[i]}
+  answers <- as.character(rpartPred_20)
+  #str(answers)  #****
+  pml_write_files(answers)
+
+   p0 <- paste(tuneLen, " ", round(ecurl$bestTune$cp, 5), ' ',
+                round(cm$overall[1], 3), ' ', 
+                 round(cm_train$overall[1], 3), ' ') 
+  filename <- paste0("rpart_prediction_", nc,".txt")
+ #filename <- paste0("rpart_prediction_", nc,"_", tuneLen, ".txt")
+  line <- cat(p0, answers[1:20], '\n', file=filename, append=TRUE)
+  #line      # should be horizontal
+  #str(line)
+  #write(line,file=filename,append=TRUE)
+
+```
+
+
+## Conclusions
+  The random tree model that we built has a 89% accuracy, which is a moderate success for first attempt. It is not as good as the 98% overall accuracy that the HAR group achieved with the same data (cite 3).
+
+## References
+
+1. http://static1.squarespace.com/static/51156277e4b0b8b2ffe11c00/t/53ad86e5e4b0b52e4e71cfab/1403881189332/Applied_Predictive_Modeling_in_R.pdf
+
+2. https://cran.r-project.org/web/packages/caret/vignettes/caret.pdf
+
+3. 
+Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.
+
+Read more: http://groupware.les.inf.puc-rio.br/har#wle_paper_section#ixzz3gjCVcSVT
